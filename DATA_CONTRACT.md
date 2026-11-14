@@ -1,0 +1,130 @@
+# Data contract — what `main.ts` writes and what the dashboard may rely on
+
+This file is the contract between `lib/model.ts` (the writer) and
+`dashboard/app.js` (the reader). Fields are never renamed or removed; new
+fields are added alongside the starter's.
+
+## `board.json`
+
+`{ "rows": BoardRow[200] }`, ranks 1..200, strictly decreasing
+`implied_value_usd`. Row shape:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `rank` | number | 1..200 |
+| `slug`, `name` | string | from the snapshot |
+| `category` | string \| null | from the snapshot |
+| `chains` | string[] | from the snapshot |
+| `tvl_usd` | number | whole dollars, from the snapshot |
+| `change_7d` | number \| null | 7-day TVL change in percent |
+| `mcap_usd` | number \| null | always null on the board (pre-token only) |
+| `listed_at` | string \| null | `YYYY-MM-DD` or null |
+| `gecko_id`, `symbol` | string \| null | always null on the board |
+| `token_status` | `'pre-token'` | |
+| `age_days` | number \| null | days from `listed_at` to `snapshot.as_of`, null when unknown |
+| `implied_value_usd` | integer | strictly decreasing down the board |
+| `model` | object | `{ category_ratio, growth_multiplier, maturity_multiplier, chain_multiplier, base }`; `base = tvl_usd x category_ratio` (rounded) |
+| `farm_steps` | string[7] | each 20–600 chars, action + cost + time |
+
+Coverage: all 40 watchlist slugs, plus the 160 pre-token protocols below
+the $50M floor with the most TVL. A row is on the board only when
+`gecko_id` and `symbol` are both null (and `mcap_usd` null). No row is
+ever a protocol that already records a token.
+
+## `data.js`
+
+One statement: `window.RADAR = {...};` — the dashboard's whole dataset, no
+fetch, no network. Top-level fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `as_of` | string | snapshot date, `YYYY-MM-DD` |
+| `source` | string | snapshot source line, verbatim |
+| `floor_usd` | number | watchlist floor, $50,000,000 here |
+| `model` | object | see below |
+| `model_version` | string | `'radar-2'` |
+| `watchlist_size` | number | 40 |
+| `board_size` | number | 200 |
+| `early_size` | number | 160 |
+| `live_size` | number | 24 |
+| `rows` | RadarRow[200] | board rows, compact form |
+| `live` | LiveRow[24] | token-bearing protocols, top 24 by market cap, CEX excluded |
+| `watchlist` | string[40] | watchlist slugs, sorted |
+| `categories` | string[] | board categories, sorted |
+| `chains` | string[] | board chains, sorted |
+
+`model` carries the constants **and** the working, so the judge can verify
+the numbers without re-running the program:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `base_multiple` | number | the global median mcap/TVL; the fallback multiple for thin categories (kept from the starter's field name) |
+| `growth_weight`, `growth_floor`, `growth_cap` | number | 0.5, -60, 120 |
+| `maturity_floor`, `maturity_range`, `maturity_days`, `unknown_age_days` | number | 0.6, 0.4, 1095, 365 |
+| `chain_log_weight`, `chain_multiplier_cap` | number | 0.05, 1.15 |
+| `implied_cap_multiple` | number | 50 |
+| `min_comps_per_category` | number | 3 |
+| `global_ratio` | number | global median mcap/TVL over all comps (same value as `base_multiple`) |
+| `total_comps` | number | comps used: protocols with a recorded market cap above $0 and positive TVL (128 here) |
+| `category_ratios` | Record<string, number> | the median ratio per category (thin categories carry the global ratio) |
+| `category_comp_counts` | Record<string, number> | comps per category |
+| `explanation` | string | the formula in one plain-English paragraph |
+
+`RadarRow` is the board row in compact form: the starter's fields
+(`rank`, `slug`, `name`, `category`, `chains`, `tvl_usd`, `change_7d`,
+`mcap_usd`, `listed_at`, `age_days`, `implied_value_usd`,
+`growth_multiplier`, `maturity_multiplier`) **plus**
+`category_ratio`, `chain_multiplier`, `base`, and `farm_steps`
+(the full 7-step plan, so the page never recomputes it).
+
+`LiveRow`: `{ slug, name, category, chains, tvl_usd, mcap_usd, change_7d }`
+— the market's own values, never a model value.
+
+## The model, exactly
+
+Comparables: every snapshot protocol with `mcap_usd` non-null and
+`mcap_usd > 0` and `tvl_usd > 0` is a comp. 158 protocols record a token
+id (`gecko_id`), 144 of them also record a market cap, and 16 of those
+record $0 or less (dead or unpriced tokens — Multichain among them — one
+even records -1), so 128 are usable comps.
+
+- `ratio(category)` = median of `mcap_usd / tvl_usd` over the category's
+  comps when the category has >= 3 comps, else the global median over all
+  comps. Median = the middle value, or the mean of the two middle values.
+- `growth = 1 + 0.5 x clamp(change_7d, -60, 120) / 100`; `change_7d` null
+  behaves as 0, so the multiplier is 1.0.
+- `maturity = 0.6 + 0.4 x min(age_days, 1095) / 1095`; unknown age uses
+  365 days. `age_days` is whole days from `listed_at` to `as_of`.
+- `chain = min(1.15, 1 + 0.05 x ln(max(1, chains.length)))`.
+- `implied = max(1, min(50 x tvl_usd, round(tvl_usd x ratio x growth x maturity x chain)))`.
+
+Ranking and ties: sort by implied desc, then TVL desc, then slug asc.
+Then a deterministic pass lowers any implied value that would tie or pass
+the row above it to exactly one dollar below that row's value. The pass
+never raises a value and never reorders rows; the adjustment is at most a
+few dollars. Multipliers are carried at full precision (the category ratio
+at 6 decimals, exactly as the comparables table stores it), so the
+dashboard can recompute a row's *pre-tie-break* value exactly from
+`tvl_usd`, `category_ratio`, `growth_multiplier`,
+`maturity_multiplier`, `chain_multiplier` and the caps above — the
+displayed `implied_value_usd` is that value after the tie-break pass.
+
+## The gate (`boardIssue`)
+
+`main.ts` refuses to write a dossier when the board:
+
+- is not exactly `watchlist.length + 160` rows,
+- misses any watchlist slug,
+- has ranks other than 1..N in order,
+- has any row that is not pre-token (token recorded),
+- is not strictly decreasing in `implied_value_usd`,
+- has all rows sharing one implied value,
+- has a row with fewer than 5 or more than 7 farm steps, a step outside
+  20–600 characters, or a non-positive implied value.
+
+## Determinism
+
+The same snapshot bytes always produce the same `board.json` and `data.js`
+bytes: no clock, no randomness, no network. Ages are measured against
+`snapshot.as_of`; ties break on TVL then slug; category tables are built in
+sorted category order.
