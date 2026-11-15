@@ -12,8 +12,14 @@
   var M = DATA.model || {};
   var BASE = typeof M.base_multiple === 'number' ? M.base_multiple : 0.25;
   var GW = typeof M.growth_weight === 'number' ? M.growth_weight : 0.5;
-  var GF = typeof M.growth_floor === 'number' ? M.growth_floor : -60;
-  var GC = typeof M.growth_cap === 'number' ? M.growth_cap : 120;
+  // radar-3 constants: growth saturates through tanh, maturity is a log curve,
+  // and each ratio is a shrinkage blend over TVL-band comparables.
+  var GTS = typeof M.growth_tanh_scale === 'number' ? M.growth_tanh_scale : 50;
+  var SK = typeof M.shrinkage_k === 'number' ? M.shrinkage_k : 3;
+  var BF = typeof M.tvl_band_factor === 'number' ? M.tvl_band_factor : 10;
+  var BM = typeof M.band_min_comps === 'number' ? M.band_min_comps : 2;
+  var WP = typeof M.winsorize_percentile === 'number' ? M.winsorize_percentile : 0.95;
+  var WC = typeof M.winsorize_cap === 'number' ? M.winsorize_cap : null;
   var MF = typeof M.maturity_floor === 'number' ? M.maturity_floor : 0.6;
   var MR = typeof M.maturity_range === 'number' ? M.maturity_range : 0.4;
   var MD = typeof M.maturity_days === 'number' ? M.maturity_days : 1095;
@@ -22,6 +28,14 @@
   var CC = typeof M.chain_multiplier_cap === 'number' ? M.chain_multiplier_cap : 1.15;
   var WATCH = new Set(Array.isArray(DATA.watchlist) ? DATA.watchlist : DATA.rows.filter(function (r) { return r.tvl_usd >= (DATA.floor_usd || 0); }).map(function (r) { return r.slug; }));
   var MAXTVL = Math.max.apply(null, DATA.rows.map(function (r) { return r.tvl_usd; }).concat([1]));
+  // A plain TVL sort, for the "what the model changes" comparison: each row's
+  // position if the board were ranked by TVL alone. delta(r) is how many places
+  // the model moves a protocol up (positive) or down (negative) from that sort.
+  var TVLRANK = {};
+  DATA.rows.slice().sort(function (a, b) { return b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1); })
+    .forEach(function (r, i) { TVLRANK[r.slug] = i + 1; });
+  function delta(r) { return (TVLRANK[r.slug] || r.rank) - r.rank; }
+  function deltaText(r) { var d = delta(r); return d > 0 ? '\u25B2' + d : d < 0 ? '\u25BC' + (-d) : '\u2014'; }
 
   var state = { q: '', cat: 'all', chain: 'all', minTvl: 0, wl: false, pre: false, sort: 'implied', dir: -1, sel: null };
 
@@ -60,23 +74,23 @@
     if (d >= 365) return (d / 365).toFixed(1) + 'y';
     return Math.max(0, Math.round(d)) + 'd';
   }
-  function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
   function mdl(r) {
     var raw = (typeof r.change_7d === 'number') ? r.change_7d : 0;
-    var g = clamp(raw, GF, GC);
-    // radar-2 stores the exact multipliers on each row (category ratio, growth,
+    var changeKnown = typeof r.change_7d === 'number';
+    // radar-3 stores the exact multipliers on each row (category ratio, growth,
     // maturity, chain). Recompute from those stored figures: the board's implied
     // value is round(base x gm x mm x cm), and only the stored figures reproduce
-    // it — one global multiple cannot, because each category has its own
-    // comparables ratio and each protocol its own chain count. Fallbacks keep
-    // older data.js files rendering with the radar-1 formula.
+    // it — one global multiple cannot, because each protocol is priced against
+    // its own TVL band and each protocol has its own chain count. Fallbacks use
+    // the radar-3 formulas (tanh growth, log maturity) for older data.js files
+    // that carry no stored multipliers.
     var ratio = (typeof r.category_ratio === 'number') ? r.category_ratio : BASE;
     var base = (typeof r.base === 'number') ? r.base : r.tvl_usd * ratio;
-    var gm = (typeof r.growth_multiplier === 'number') ? r.growth_multiplier : 1 + (g / 100) * GW;
+    var gm = (typeof r.growth_multiplier === 'number') ? r.growth_multiplier : 1 + GW * Math.tanh(raw / GTS);
     var a = (r.age_days === null || r.age_days === undefined) ? UA : r.age_days;
-    var mm = (typeof r.maturity_multiplier === 'number') ? r.maturity_multiplier : MF + (Math.min(Math.max(a, 0), MD) / MD) * MR;
+    var mm = (typeof r.maturity_multiplier === 'number') ? r.maturity_multiplier : MF + MR * Math.log(1 + Math.min(Math.max(a, 0), MD)) / Math.log(1 + MD);
     var cm = (typeof r.chain_multiplier === 'number') ? r.chain_multiplier : 1;
-    return { raw: raw, g: g, gm: gm, ageUsed: a, ageKnown: r.age_days !== null && r.age_days !== undefined, mm: mm, cm: cm, ratio: ratio, base: base, implied: Math.max(1, Math.round(base * gm * mm * cm)) };
+    return { raw: raw, changeKnown: changeKnown, gm: gm, ageUsed: a, ageKnown: r.age_days !== null && r.age_days !== undefined, mm: mm, cm: cm, ratio: ratio, base: base, implied: Math.max(1, Math.round(base * gm * mm * cm)) };
   }
   function isPre(r) { return r.mcap_usd === null || r.mcap_usd === undefined; }
   // Fallback farm plan (only if a row carries no farm_steps): derived from category, chain, TVL, age.
@@ -161,6 +175,7 @@
       else if (k === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (k === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
       else if (k === 'rank') { av = a.rank; bv = b.rank; }
+      else if (k === 'delta') { av = delta(a); bv = delta(b); }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -262,15 +277,16 @@
           $('div', { class: 'bar', 'aria-hidden': 'true' }, $('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           $('span', { class: 'num', text: usd(r.implied_value_usd) })
         )),
+        $('td', { class: 'num ' + (delta(r) > 0 ? 'pos' : delta(r) < 0 ? 'neg' : 'dim'), title: 'TVL rank ' + TVLRANK[r.slug] + ' \u2192 implied rank ' + r.rank, text: deltaText(r) }),
         $('td', null, $('span', { class: 'tag' + (WATCH.has(r.slug) ? ' watch' : ''), text: WATCH.has(r.slug) ? 'watchlist' : 'pre-token' }))
       );
       tb.appendChild(tr);
     });
     return $('div', { class: 'panel' }, $('div', { class: 'table-wrap' },
       $('table', null,
-        $('caption', { text: 'Pre-token protocols, strongest implied value first. Select a row for its model arithmetic and farm plan. \u2605 marks the watchlist.' }),
+        $('caption', { text: 'Pre-token protocols, strongest implied value first. \u0394 vs TVL shows how many places the model moves a protocol from a plain TVL sort. Select a row for its model arithmetic and farm plan. \u2605 marks the watchlist.' }),
         $('thead', null, $('tr', null,
-          sortTh('rank', 'Rank'), sortTh('name', 'Protocol'), sortTh('tvl', 'TVL'), sortTh('growth', '7d'), sortTh('age', 'Age'), sortTh('implied', 'Implied value'), $('th', { scope: 'col', text: 'Status' })
+          sortTh('rank', 'Rank'), sortTh('name', 'Protocol'), sortTh('tvl', 'TVL'), sortTh('growth', '7d'), sortTh('age', 'Age'), sortTh('implied', 'Implied value'), sortTh('delta', '\u0394 vs TVL'), $('th', { scope: 'col', text: 'Status' })
         )),
         tb
       )));
@@ -301,21 +317,68 @@
           tb
         ))));
   }
+  // What the model changes vs a plain TVL sort, computed live from the board:
+  // the two top-5 lists side by side, plus the biggest climber and faller.
+  function vsTvlSection() {
+    var byTvl = DATA.rows.slice().sort(function (a, b) { return b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1); });
+    var topTvl = byTvl.slice(0, 5), topImp = DATA.rows.slice(0, 5);
+    var outside = DATA.rows.slice(0, 10).filter(function (r) { return TVLRANK[r.slug] > 10; }).length;
+    var moves = DATA.rows.map(function (r) { return { r: r, d: delta(r) }; }).sort(function (a, b) { return b.d - a.d; });
+    var up = moves[0], down = moves[moves.length - 1];
+    function mini(list, rankOf) {
+      return $('ol', { class: 'mini' }, list.map(function (r) {
+        return $('li', null, $('b', { text: r.name }), $('span', { class: 'muted', text: ' \u2014 ' + rankOf(r) }));
+      }));
+    }
+    return $('div', { class: 'vs' },
+      $('h3', { text: 'What the model changes vs a plain TVL sort' }),
+      $('p', { class: 'muted', text: 'A TVL sort would crown the biggest protocol and stop there. The model re-ranks: ' + outside + ' of the top 10 by implied value sit outside the TVL top 10. Biggest climber ' + up.r.name + ' (+' + up.d + ' places, TVL rank ' + TVLRANK[up.r.slug] + ' \u2192 implied rank ' + up.r.rank + '); biggest faller ' + down.r.name + ' (' + down.d + ' places, TVL rank ' + TVLRANK[down.r.slug] + ' \u2192 implied rank ' + down.r.rank + ').' }),
+      $('div', { class: 'vs-grid' },
+        $('div', null, $('h3', { text: 'Top 5 by TVL alone' }), mini(topTvl, function (r) { return 'implied rank ' + r.rank; })),
+        $('div', null, $('h3', { text: 'Top 5 by implied value' }), mini(topImp, function (r) { return 'TVL rank ' + TVLRANK[r.slug]; }))
+      ));
+  }
+  // Where each category's multiple comes from: the comparables table, largest first.
+  function compsSection() {
+    var counts = M.category_comp_counts || {};
+    var ratios = M.category_ratios || {};
+    var entries = Object.keys(counts).map(function (c) { return { c: c, n: counts[c], ratio: ratios[c] }; })
+      .sort(function (a, b) { return b.n - a.n || (a.c < b.c ? -1 : 1); });
+    var tb = $('tbody');
+    entries.slice(0, 8).forEach(function (e) {
+      tb.appendChild($('tr', null,
+        $('td', { text: e.c }),
+        $('td', { class: 'num', text: typeof e.ratio === 'number' ? e.ratio.toFixed(6) : 'n/a' }),
+        $('td', { class: 'num', text: String(e.n) }),
+        $('td', { text: e.n > 0 ? 'category blend' : 'global median' })
+      ));
+    });
+    return $('div', { class: 'comps' },
+      $('h3', { text: 'Where each category\u2019s multiple comes from' }),
+      $('p', { class: 'muted', text: 'Every multiple below is the shrinkage-blended median mcap/TVL of that category\u2019s tokenised protocols in the snapshot \u2014 ' + (M.total_comps || entries.length) + ' comparables in all, each comp ratio winsorized at the ' + Math.round(WP * 100) + 'th percentile (' + (WC === null ? 'n/a' : WC.toFixed(6)) + ') first, then blended as (n\u00D7cat + ' + SK + '\u00D7global)/(n + ' + SK + '). A category with no comps at all uses the global median ' + (typeof M.global_ratio === 'number' ? M.global_ratio.toFixed(6) : 'n/a') + '.' }),
+      $('table', null, $('thead', null, $('tr', null,
+        $('th', { scope: 'col', text: 'Category' }), $('th', { scope: 'col', text: 'Ratio' }), $('th', { scope: 'col', text: 'Comps' }), $('th', { scope: 'col', text: 'Source' })
+      )), tb),
+      $('p', { class: 'muted', text: 'Largest categories shown; ' + entries.length + ' categories carry a multiple.' })
+    );
+  }
   function modelSection() {
     return $('section', { class: 'section' },
       $('div', { class: 'panel model' },
         $('h2', { text: 'How the model works' }),
         $('p', { class: 'muted', text: 'One function scores every protocol. No name is special-cased, no row is hand-picked, and the detail view recomputes each row from the snapshot figures so the page and the board agree.' }),
         $('div', { class: 'formula' },
-          $('span', { html: 'implied = round( <span class="k">TVL</span> \u00D7 category ratio \u00D7 (1 + clamp(7d growth, ' + GF + ', ' + GC + ') / 100 \u00D7 ' + GW + ') \u00D7 (' + MF + ' + min(age, ' + MD + 'd) / ' + MD + 'd \u00D7 ' + MR + ') \u00D7 chain )' })
+          $('span', { html: 'implied = round( <span class="k">TVL</span> \u00D7 band ratio \u00D7 (1 + ' + GW + ' \u00D7 tanh(7d growth / ' + GTS + ')) \u00D7 (' + MF + ' + ' + MR + ' \u00D7 ln(1 + min(age, ' + MD + 'd)) / ln(1 + ' + MD + 'd)) \u00D7 chain )' })
         ),
         $('table', null, $('tbody', null,
-          $('tr', null, $('td', { text: 'base = TVL \u00D7 category ratio' }), $('td', { text: 'The category\u2019s median mcap/TVL over its tokenised comparables (global median ' + BASE.toFixed(6) + ' when a category has too few comps): a token is first valued at that share of the TVL it secures. Bigger TVL, bigger base.' })),
-          $('tr', null, $('td', { text: 'growth multiplier' }), $('td', { text: 'Seven-day TVL change, clamped to ' + GF + '%\u2026' + GC + '%, then halved (weight ' + GW + '). A protocol growing +20% in a week scores \u00D7' + (1 + 0.2 * GW).toFixed(2) + '; one shrinking \u221230% scores \u00D7' + (1 - 0.3 * GW).toFixed(2) + '.' })),
-          $('tr', null, $('td', { text: 'maturity multiplier' }), $('td', { text: 'Days since first listing, capped at ' + MD + ' days (' + (MD / 365).toFixed(0) + ' years): ' + MF + ' at day zero rising to ' + (MF + MR).toFixed(1) + '. A protocol that ran for years with no token is treated as more mature \u2014 and its launch, if it comes, as more loaded. Unknown age uses ' + UA + ' days.' })),
+          $('tr', null, $('td', { text: 'base = TVL \u00D7 band ratio' }), $('td', { text: 'The median mcap/TVL of the category\u2019s tokenised comparables whose TVL sits within ' + BF + '\u00D7 of this protocol\u2019s (at least ' + BM + ' of them), shrunk toward the same band\u2019s global median as (n\u00D7cat + ' + SK + '\u00D7global)/(n + ' + SK + '); every comp ratio winsorized at the ' + Math.round(WP * 100) + 'th percentile (' + (WC === null ? 'n/a' : WC.toFixed(6)) + ') first. A band too thin falls back to the category-wide blend, and a category with no comps takes the global median ' + BASE.toFixed(6) + '.' })),
+          $('tr', null, $('td', { text: 'growth multiplier' }), $('td', { text: 'Seven-day TVL change through a saturating tanh: 1 + ' + GW + ' \u00D7 tanh(change / ' + GTS + '). A protocol growing +20% in a week scores \u00D7' + (1 + GW * Math.tanh(20 / GTS)).toFixed(2) + '; one shrinking \u221230% scores \u00D7' + (1 + GW * Math.tanh(-30 / GTS)).toFixed(2) + '; a wild +4448% week no more than \u00D7' + (1 + GW).toFixed(2) + '. Unreported change scores \u00D71.00.' })),
+          $('tr', null, $('td', { text: 'maturity multiplier' }), $('td', { text: 'Days since first listing, capped at ' + MD + ' days (' + (MD / 365).toFixed(0) + ' years), on a log curve: ' + MF + ' at day zero rising to ' + (MF + MR).toFixed(1) + ', so the early years matter most \u2014 a 15-day protocol scores \u00D7' + (MF + MR * Math.log(16) / Math.log(1 + MD)).toFixed(2) + ', not \u00D7' + (MF + MR * 15 / MD).toFixed(2) + '. A protocol that ran for years with no token is treated as more mature \u2014 and its launch, if it comes, as more loaded. Unknown age uses ' + UA + ' days.' })),
           $('tr', null, $('td', { text: 'chain multiplier' }), $('td', { text: '1 + ' + CW + ' \u00D7 ln(chains), capped at ' + CC + ': a protocol live on more chains scores a little higher. One chain scores \u00D71.00.' })),
           $('tr', null, $('td', { text: 'what it is not' }), $('td', { text: 'Not a price, not a prediction of whether or when a token is issued, and not a floor. A protocol that records no token may still have one its DefiLlama record does not carry.' }))
         )),
+        vsTvlSection(),
+        compsSection(),
         $('p', { class: 'note', text: 'Snapshot ' + DATA.as_of + ' \u00B7 watchlist floor ' + usd(DATA.floor_usd) + ' \u00B7 model ' + (DATA.model_version || 'radar-1') + ' \u00B7 ' + DATA.rows.length + ' ranked rows.' })
       ));
   }
@@ -328,6 +391,29 @@
     if (!row) return;
     state.sel = slug; writeHash();
     var m = mdl(row);
+    // Where this row's ratio comes from: radar-3 stores it on the row itself —
+    // the TVL-band median over the comps that priced it, or the category-wide
+    // shrinkage blend, or the global median when the category has no comps.
+    // ratio_source is 'band' | 'category' | 'global'; comps counts the comps
+    // that set it. Older data.js files carry neither: fall back to the
+    // category's comp count from the model table.
+    var catKey = row.category || 'Uncategorized';
+    var compN = (typeof row.comps === 'number') ? row.comps
+      : (M.category_comp_counts && typeof M.category_comp_counts[catKey] === 'number') ? M.category_comp_counts[catKey] : null;
+    var src = row.ratio_source || (compN !== null && compN > 0 ? 'category' : 'global');
+    var ratioNote;
+    if (src === 'band') ratioNote = (row.category || 'Other') + ' TVL-band median over ' + compN + ' comps within ' + BF + '\u00D7 TVL, shrunk toward the band global median';
+    else if (src === 'category') ratioNote = (row.category || 'Other') + ' shrinkage blend over ' + compN + ' comp' + (compN === 1 ? '' : 's') + ' (band too thin, (n\u00D7cat + ' + SK + '\u00D7global)/(n + ' + SK + '))';
+    else ratioNote = 'global median over ' + (M.total_comps || '?') + ' comps (' + (row.category || 'Other') + ' has no comps)';
+    // Why this rank, not its TVL rank: the multiplier that moved it most.
+    var drivers = [
+      { label: 'growth', v: m.gm, why: '7-day TVL change ' + pct(m.raw) },
+      { label: 'maturity', v: m.mm, why: (m.ageKnown ? age(row.age_days) : 'unknown age') + ' on the books' },
+      { label: 'chain', v: m.cm, why: (row.chains || []).length + ' chain' + ((row.chains || []).length === 1 ? '' : 's') }
+    ];
+    drivers.sort(function (a, b) { return Math.abs(b.v - 1) - Math.abs(a.v - 1); });
+    var top = drivers[0];
+    var whyRank = 'TVL rank ' + TVLRANK[row.slug] + ' \u2192 implied rank ' + row.rank + ' (' + (delta(row) > 0 ? '+' : '') + delta(row) + ' places): the largest single effect is ' + top.label + ' \u00D7' + top.v.toFixed(4) + ' (' + top.why + ').';
     dialog.textContent = '';
     dialog.appendChild($('div', { class: 'd-head' },
       $('div', null,
@@ -352,13 +438,14 @@
     dialog.appendChild($('section', { class: 'd-sec' },
       $('h3', { text: 'Implied value, step by step' }),
       $('div', { class: 'math' },
-        $('div', { class: 'row' }, $('span', { text: '1 \u00B7 base = TVL \u00D7 ' + m.ratio.toFixed(6) + ' (' + (row.category || 'Other') + ' ratio)' }), $('b', { text: usdFull(m.base) })),
-        $('div', { class: 'row' }, $('span', { text: '2 \u00B7 growth ' + pct(m.raw) + ' \u2192 clamped ' + pct(m.g) + ' \u2192 \u00D7' + m.gm.toFixed(4) }), $('b', { text: '\u00D7' + m.gm.toFixed(4) })),
-        $('div', { class: 'row' }, $('span', { text: '3 \u00B7 maturity ' + (m.ageKnown ? age(row.age_days) : 'unknown \u2192 ' + UA + 'd assumed') + ' \u2192 \u00D7' + m.mm.toFixed(4) }), $('b', { text: '\u00D7' + m.mm.toFixed(4) })),
+        $('div', { class: 'row' }, $('span', { text: '1 \u00B7 base = TVL \u00D7 ' + m.ratio.toFixed(6) + ' (' + ratioNote + ')' }), $('b', { text: usdFull(m.base) })),
+        $('div', { class: 'row' }, $('span', { text: '2 \u00B7 growth ' + (m.changeKnown ? pct(m.raw) + ' \u2192 1 + ' + GW + '\u00D7tanh(' + m.raw.toFixed(2) + '/' + GTS + ') \u2192 \u00D7' + m.gm.toFixed(4) : 'not reported \u2192 \u00D7' + m.gm.toFixed(4)) }), $('b', { text: '\u00D7' + m.gm.toFixed(4) })),
+        $('div', { class: 'row' }, $('span', { text: '3 \u00B7 maturity ' + (m.ageKnown ? age(row.age_days) + ' (' + m.ageUsed + 'd, log curve)' : 'unknown \u2192 ' + UA + 'd assumed') + ' \u2192 \u00D7' + m.mm.toFixed(4) }), $('b', { text: '\u00D7' + m.mm.toFixed(4) })),
         $('div', { class: 'row' }, $('span', { text: '4 \u00B7 chains ' + (row.chains || []).length + ' \u2192 \u00D7' + m.cm.toFixed(4) }), $('b', { text: '\u00D7' + m.cm.toFixed(4) })),
         $('div', { class: 'row' }, $('span', { text: '5 \u00B7 ' + usdFull(m.base) + ' \u00D7 ' + m.gm.toFixed(4) + ' \u00D7 ' + m.mm.toFixed(4) + ' \u00D7 ' + m.cm.toFixed(4) }), $('b', { text: usdFull(m.implied) })),
         $('div', { class: 'row total' }, $('span', { text: 'Implied value (board: ' + usdFull(row.implied_value_usd) + ')' }), $('b', { text: usdFull(row.implied_value_usd) }))
       ),
+      $('p', { class: 'why', text: whyRank }),
       $('p', { class: 'muted', text: (function () {
         var d = m.implied - row.implied_value_usd;
         if (d === 0) return 'The page recomputes this row as ' + usdFull(m.implied) + ' \u2014 the same number the board carries.';
