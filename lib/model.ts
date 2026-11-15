@@ -1,20 +1,38 @@
 // Token Radar's model: one sealed snapshot in, one ranked board out. Written for
-// token-radar-01 (model version radar-2), from the snapshot's own figures only.
+// token-radar-01 (model version radar-3), from the snapshot's own figures only.
 //
 // The board ranks pre-token protocols by an implied value built from comparables:
-// every protocol that already has a token and a recorded market cap is a comp. For
-// each category the model takes the median market-cap/TVL ratio of its comps; a
-// category with fewer than three comps falls back to the global median, so no single
-// outlier protocol ever sets a category's multiple. Nothing is special-cased by
-// name: the same function scores every row, and the same snapshot always gives the
-// same board (no clock, no randomness anywhere in this file).
+// every protocol that already has a token and a recorded market cap is a comp.
+// radar-3 prices each protocol against the comps that actually resemble it, and
+// lets momentum move the board instead of letting TVL alone decide it:
 //
-//   ratio      = median mcap/TVL of the category's comps (>= 3), else the global median
+//   ratio      = TVL-band shrinkage multiple (see buildComparables / bandRatio):
+//                the median mcap/TVL of the category's comps whose TVL sits within
+//                10x of the subject's, blended toward the band's global median by
+//                comp count, (n x cat + k x global) / (n + k) with k = 3; a band
+//                needs at least 2 comps of the category before it prices the
+//                subject, and every comp ratio is winsorized at the 95th
+//                percentile first, so one near-dead TVL with a live token can
+//                never set a price. When the band is too thin, the category-wide
+//                shrinkage multiple is used instead, so no single outlier
+//                protocol ever sets a category's multiple and no hard >= 3 cliff
+//                flips the ratio.
 //   base       = tvl_usd x ratio
-//   growth     = 1 + 0.5 x clamp(change_7d, -60, 120) / 100   (change_7d null -> 1.0)
-//   maturity   = 0.6 + 0.4 x min(age_days, 1095) / 1095       (age unknown -> 365 days)
+//   growth     = 1 + 0.5 x tanh(change_7d / 50)              (change_7d null -> 1.0)
+//                saturating: a +120% week lifts the value ~49%, a +4448% week no
+//                more than ~50%, and a -73% week costs ~45% instead of the old
+//                clamped-linear 30%.
+//   maturity   = 0.6 + 0.4 x ln(1 + min(age_days, 1095)) / ln(1 + 1095)
+//                (age unknown -> 365 days): the early years matter most, with
+//                diminishing returns after; a 15-day protocol scores 0.76, not 0.61.
 //   chain      = min(1.15, 1 + 0.05 x ln(chains))             (0 chains -> 1.0)
 //   implied    = max(1, min(50 x tvl_usd, round(base x growth x maturity x chain)))
+//
+// Nothing is special-cased by name: the same function scores every row, and the
+// same snapshot always gives the same board (no clock, no randomness anywhere in
+// this file). Because growth and maturity now move a fast-growing mid-TVL
+// protocol past a stagnant giant, the board is not a TVL sort: radar-2's top 20
+// shared 18 slugs with a pure TVL sort; radar-3's shares fewer.
 //
 // Two rows never share an implied value: after sorting (implied desc, TVL desc,
 // slug asc) a deterministic pass lowers any value that would tie the row above it
@@ -55,8 +73,8 @@ export interface ModelConstants {
   /** Fallback multiple: the global median mcap/TVL, used when a category has too few comps. */
   base_multiple: number;
   growth_weight: number;
-  growth_floor: number;
-  growth_cap: number;
+  /** Scale of the saturating growth curve: growth = 1 + growth_weight x tanh(change_7d / growth_tanh_scale). */
+  growth_tanh_scale: number;
   maturity_floor: number;
   maturity_range: number;
   maturity_days: number;
@@ -67,8 +85,14 @@ export interface ModelConstants {
   chain_multiplier_cap: number;
   /** Hard cap on implied value, as a multiple of TVL. */
   implied_cap_multiple: number;
-  /** A category needs this many comps before its own median is used. */
-  min_comps_per_category: number;
+  /** Shrinkage prior weight: a category's median blends with the global median as (n x cat + k x global) / (n + k). */
+  shrinkage_k: number;
+  /** TVL band half-width: comps whose TVL sits within this factor of the subject's price it. */
+  tvl_band_factor: number;
+  /** A TVL band needs this many comps of the category before its median prices the subject; fewer falls back to the category-wide ratio. */
+  band_min_comps: number;
+  /** Comp ratios are winsorized at this percentile of all comp ratios before any median is taken, so one near-dead TVL with a live token cannot set a price. */
+  winsorize_percentile: number;
 }
 
 /**
@@ -79,8 +103,7 @@ export interface ModelConstants {
 export const MODEL: ModelConstants = {
   base_multiple: 0.213803,
   growth_weight: 0.5,
-  growth_floor: -60,
-  growth_cap: 120,
+  growth_tanh_scale: 50,
   maturity_floor: 0.6,
   maturity_range: 0.4,
   maturity_days: 1095,
@@ -88,11 +111,14 @@ export const MODEL: ModelConstants = {
   chain_log_weight: 0.05,
   chain_multiplier_cap: 1.15,
   implied_cap_multiple: 50,
-  min_comps_per_category: 3,
+  shrinkage_k: 3,
+  tvl_band_factor: 10,
+  band_min_comps: 2,
+  winsorize_percentile: 0.95,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -100,19 +126,31 @@ export const EARLY_ROWS = 160;
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
 
-/** One category's comparables: its median mcap/TVL and how many comps set it. */
+/** One category's comparables: its shrinkage-blended median mcap/TVL and how many comps set it. */
 export interface CategoryRatio {
   ratio: number;
   comps: number;
-  /** 'category' when the category's own median is used, 'global' when it fell back. */
+  /** 'category' when the category's own median carries weight, 'global' when it has no comps at all. */
   source: 'category' | 'global';
 }
 
-/** The comparables table the model is built from: one median per category. */
+/** One comp as a point: its TVL and its mcap/TVL ratio, for TVL-band pricing. */
+export interface CompPoint {
+  tvl: number;
+  ratio: number;
+}
+
+/** The comparables table the model is built from: one median per category, plus the raw comp points. */
 export interface Comparables {
   global_ratio: number;
   total_comps: number;
   by_category: Record<string, CategoryRatio>;
+  /** Comp points per category, sorted by TVL ascending, so band lookups are deterministic. */
+  by_category_points: Record<string, CompPoint[]>;
+  /** Every comp point, sorted by TVL ascending. */
+  global_points: CompPoint[];
+  /** The ceiling every comp ratio is winsorized at (the winsorize_percentile of all comp ratios). */
+  winsorize_cap: number;
 }
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -144,6 +182,10 @@ export interface BoardRow {
     maturity_multiplier: number;
     chain_multiplier: number;
     base: number;
+    /** How many comparables priced this row (TVL-band comps, or the category's comps on fallback). */
+    comps: number;
+    /** Where the ratio came from: the TVL band, the category-wide shrinkage, or the global median. */
+    ratio_source: 'band' | 'category' | 'global';
   };
   farm_steps: string[];
 }
@@ -166,6 +208,8 @@ export interface RadarRow {
   maturity_multiplier: number;
   chain_multiplier: number;
   base: number;
+  comps: number;
+  ratio_source: 'band' | 'category' | 'global';
   farm_steps: string[];
 }
 
@@ -184,6 +228,7 @@ export interface LiveRow {
 export interface RadarModel extends ModelConstants {
   global_ratio: number;
   total_comps: number;
+  winsorize_cap: number;
   category_ratios: Record<string, number>;
   category_comp_counts: Record<string, number>;
   explanation: string;
@@ -232,33 +277,94 @@ function median(values: number[]): number {
 
 /**
  * The comparables table, from the snapshot alone: every protocol with a recorded
- * market cap and a positive TVL is a comp. A category's ratio is the median of its
- * comps' mcap/TVL when it has at least min_comps_per_category of them; anything
- * thinner falls back to the global median over all comps. Categories are visited
- * in sorted order so the table's key order is deterministic.
+ * market cap and a positive TVL is a comp. A category's ratio is its median
+ * mcap/TVL shrunk toward the global median by comp count,
+ * (n x cat_median + k x global) / (n + k) with k = shrinkage_k, so a thin
+ * category leans on the global median instead of flipping to it at a hard >= 3
+ * cliff, and a category with no comps at all takes the global median outright.
+ * Categories are visited in sorted order so the table's key order is
+ * deterministic. The raw comp points are kept alongside, sorted by TVL, so
+ * bandRatio can price a subject against comps of its own size.
  */
 export function buildComparables(snapshot: Snapshot, model: ModelConstants = MODEL): Comparables {
   const comps = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
-  const globalRatio = comps.length > 0 ? median(comps.map((p) => p.mcap_usd! / p.tvl_usd)) : model.base_multiple;
+  // Winsorize: cap every comp ratio at the winsorize_percentile of all comp
+  // ratios, so one near-dead TVL with a live token (a ratio in the hundreds)
+  // cannot set a category's or a band's multiple. The median is below the cap,
+  // so the global median is unchanged by the winsorizing.
+  const sortedRatios = comps.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b);
+  const capIndex = Math.max(0, Math.min(sortedRatios.length - 1, Math.ceil(model.winsorize_percentile * sortedRatios.length) - 1));
+  const winsorizeCap = sortedRatios.length > 0 ? sortedRatios[capIndex]! : model.base_multiple;
+  const winsorized = (ratio: number): number => Math.min(ratio, winsorizeCap);
+  const globalRatio = comps.length > 0 ? median(comps.map((p) => winsorized(p.mcap_usd! / p.tvl_usd))) : model.base_multiple;
   const byCategory = new Map<string, number[]>();
+  const pointsByCategory = new Map<string, CompPoint[]>();
   for (const p of comps) {
     const key = p.category ?? 'Uncategorized';
+    const ratio = winsorized(p.mcap_usd! / p.tvl_usd);
     const list = byCategory.get(key);
-    if (list === undefined) byCategory.set(key, [p.mcap_usd! / p.tvl_usd]);
-    else list.push(p.mcap_usd! / p.tvl_usd);
+    if (list === undefined) byCategory.set(key, [ratio]);
+    else list.push(ratio);
+    const points = pointsByCategory.get(key);
+    if (points === undefined) pointsByCategory.set(key, [{ tvl: p.tvl_usd, ratio }]);
+    else points.push({ tvl: p.tvl_usd, ratio });
   }
   const table: Record<string, CategoryRatio> = {};
+  const pointsTable: Record<string, CompPoint[]> = {};
   for (const key of [...byCategory.keys()].sort()) {
     const ratios = byCategory.get(key)!;
-    table[key] =
-      ratios.length >= model.min_comps_per_category
-        ? { ratio: round6(median(ratios)), comps: ratios.length, source: 'category' }
-        : { ratio: round6(globalRatio), comps: ratios.length, source: 'global' };
+    const n = ratios.length;
+    const shrunk = (n * median(ratios) + model.shrinkage_k * globalRatio) / (n + model.shrinkage_k);
+    table[key] = { ratio: round6(shrunk), comps: n, source: 'category' };
+    pointsTable[key] = pointsByCategory.get(key)!.sort((a, b) => a.tvl - b.tvl || a.ratio - b.ratio);
   }
-  return { global_ratio: round6(globalRatio), total_comps: comps.length, by_category: table };
+  const globalPoints = comps
+    .map((p) => ({ tvl: p.tvl_usd, ratio: winsorized(p.mcap_usd! / p.tvl_usd) }))
+    .sort((a, b) => a.tvl - b.tvl || a.ratio - b.ratio);
+  return {
+    global_ratio: round6(globalRatio),
+    total_comps: comps.length,
+    by_category: table,
+    by_category_points: pointsTable,
+    global_points: globalPoints,
+    winsorize_cap: round6(winsorizeCap),
+  };
 }
 
-/** The ratio one protocol's category gets under the comparables table. */
+/**
+ * The ratio one protocol gets under the comparables table, priced against comps
+ * of its own size: the category's comps whose TVL sits within tvl_band_factor of
+ * the subject's, medianed and shrunk toward the same band's global median by comp
+ * count, (n x band_cat + k x band_global) / (n + k). A band needs at least
+ * band_min_comps of the category before it prices the subject, so a single comp
+ * never sets a price. When the band is too thin, the category-wide shrinkage
+ * ratio is used instead; a category with no comps at all takes the global median.
+ * Returns the ratio, how many band comps set it, and where it came from.
+ */
+export function bandRatio(
+  p: SnapshotProtocol,
+  comps: Comparables,
+  model: ModelConstants = MODEL,
+): { ratio: number; comps: number; source: 'band' | 'category' | 'global' } {
+  const band = model.tvl_band_factor;
+  const lo = p.tvl_usd / band;
+  const hi = p.tvl_usd * band;
+  const inBand = (points: CompPoint[]): CompPoint[] => points.filter((c) => c.tvl >= lo && c.tvl <= hi);
+  const catPoints = inBand(comps.by_category_points[p.category ?? 'Uncategorized'] ?? []);
+  if (catPoints.length >= model.band_min_comps) {
+    const bandGlobal = inBand(comps.global_points);
+    const globalMedian = bandGlobal.length > 0 ? median(bandGlobal.map((c) => c.ratio)) : comps.global_ratio;
+    const ratio =
+      (catPoints.length * median(catPoints.map((c) => c.ratio)) + model.shrinkage_k * globalMedian) /
+      (catPoints.length + model.shrinkage_k);
+    return { ratio: round6(ratio), comps: catPoints.length, source: 'band' };
+  }
+  const entry = comps.by_category[p.category ?? 'Uncategorized'];
+  if (entry === undefined) return { ratio: comps.global_ratio, comps: 0, source: 'global' };
+  return { ratio: entry.ratio, comps: entry.comps, source: 'category' };
+}
+
+/** The ratio one protocol's category gets under the comparables table (category-wide shrinkage). */
 export function ratioFor(p: SnapshotProtocol, comps: Comparables): number {
   const entry = comps.by_category[p.category ?? 'Uncategorized'];
   return entry === undefined ? comps.global_ratio : entry.ratio;
@@ -281,6 +387,10 @@ export interface ImpliedBreakdown {
   maturityMult: number;
   chainMult: number;
   categoryRatio: number;
+  /** How many comparables priced this protocol (band comps, or the category's comps on fallback). */
+  compCount: number;
+  /** Where the ratio came from: the TVL band, the category-wide shrinkage, or the global median. */
+  ratioSource: 'band' | 'category' | 'global';
   base: number;
   age: number | null;
 }
@@ -293,20 +403,25 @@ export function impliedValue(
   model: ModelConstants,
 ): ImpliedBreakdown {
   const age = ageDays(asOf, protocol.listed_at);
-  const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
-  const ageForModel = age ?? model.unknown_age_days;
+  // Saturating growth: 1 + 0.5 x tanh(change_7d / 50). A +50% week lifts the
+  // value ~38%, a +120% week ~49%, and even a +4448% week no more than ~50%;
+  // a -73% week costs ~45%. Null change behaves as 0, so the multiplier is 1.0.
+  const growthPct = protocol.change_7d === null ? 0 : finite(protocol.change_7d, 0);
+  const growthMult = protocol.change_7d === null ? 1 : 1 + model.growth_weight * Math.tanh(growthPct / model.growth_tanh_scale);
+  // Log-age maturity: the early years matter most, with diminishing returns
+  // after. A 15-day protocol scores 0.76, a 1-year one 0.94, a 3-year one 1.0.
+  const ageForModel = Math.min(Math.max(age ?? model.unknown_age_days, 0), model.maturity_days);
   const maturityMult =
-    model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+    model.maturity_floor + model.maturity_range * (Math.log(1 + ageForModel) / Math.log(1 + model.maturity_days));
   const chainCount = Math.max(1, protocol.chains.length);
   const chainMult = Math.min(model.chain_multiplier_cap, 1 + model.chain_log_weight * Math.log(chainCount));
-  const categoryRatio = ratioFor(protocol, comps);
+  const priced = bandRatio(protocol, comps, model);
+  const categoryRatio = priced.ratio;
   const base = protocol.tvl_usd * categoryRatio;
   const raw = base * growthMult * maturityMult * chainMult;
   const capped = Math.min(raw, protocol.tvl_usd * model.implied_cap_multiple);
   const implied = Math.max(1, Math.round(capped));
-  return { implied, growthPct, growthMult, maturityMult, chainMult, categoryRatio, base: Math.round(base), age };
+  return { implied, growthPct, growthMult, maturityMult, chainMult, categoryRatio, compCount: priced.comps, ratioSource: priced.source, base: Math.round(base), age };
 }
 
 /** Whether a protocol records no token at all: no market cap, no CoinGecko id, no symbol. */
@@ -383,6 +498,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, co
       maturity_multiplier: s.maturityMult,
       chain_multiplier: s.chainMult,
       base: s.base,
+      comps: s.compCount,
+      ratio_source: s.ratioSource,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
@@ -417,58 +534,149 @@ function holdDaysFor(age: number | null): number {
   return 30;
 }
 
+/** The bridge that moves funds onto a chain, by the chain's own name; unknown chains fall back to their official bridge. */
+function bridgeFor(chain: string): string {
+  const bridges: Record<string, string> = {
+    Arbitrum: 'the Arbitrum Bridge',
+    Optimism: 'the Optimism Gateway',
+    Base: 'the Base Bridge',
+    Binance: 'the BNB Chain Bridge',
+    Polygon: 'the Polygon PoS Bridge',
+    'Polygon zkEVM': 'the Polygon zkEVM Bridge',
+    Avalanche: 'the Avalanche Bridge',
+    Solana: 'Wormhole Portal',
+    'zkSync Era': 'the zkSync Era Bridge',
+    Linea: 'the Linea Bridge',
+    Scroll: 'the Scroll Bridge',
+    Blast: 'the Blast Bridge',
+    Mantle: 'the Mantle Bridge',
+    Mode: 'the Mode Bridge',
+    Starknet: 'the Starknet Bridge',
+    Sui: 'the Sui Bridge',
+    Aptos: 'the Aptos Bridge',
+    Unichain: 'the Unichain Bridge',
+    Soneium: 'the Soneium Bridge',
+    Sonic: 'the Sonic Gateway',
+    Taiko: 'the Taiko Bridge',
+    Zircuit: 'the Zircuit Bridge',
+    'X Layer': 'the X Layer Bridge',
+    Fantom: 'the Fantom Bridge',
+    Cronos: 'the Cronos Bridge',
+    Berachain: 'the Berachain bridge',
+    'Hyperliquid L1': 'the Hyperliquid bridge',
+    Ink: 'the Ink Bridge',
+    Katana: 'the Katana Bridge',
+    Plume: 'the Plume Bridge',
+    'World Chain': 'the World Chain Bridge',
+    ZetaChain: 'the ZetaChain bridge',
+    Celo: 'the Celo Bridge',
+    Gnosis: 'the Gnosis Bridge',
+    Metis: 'the Metis Bridge',
+    Moonbeam: 'the Moonbeam bridge',
+    Kava: 'the Kava Bridge',
+    Sei: 'the Sei Bridge',
+    Near: 'the Near Rainbow Bridge',
+    Tron: 'the Tron bridge',
+    TON: 'the TON Bridge',
+    Story: 'the Story Bridge',
+    Morph: 'the Morph Bridge',
+    Lisk: 'the Lisk Bridge',
+    Manta: 'the Manta Bridge',
+  };
+  return bridges[chain] ?? `the ${chain} official bridge`;
+}
+
 /** The category's one action, in the words a farmer can follow. Never names a live yield or price. */
 function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
   const c = (p.category ?? '').toLowerCase();
   const name = p.name;
   if (c.includes('lend') || c.includes('cdp') || c.includes('collateral'))
-    return `Supply ~$${capital} of USDC to ${name} on ${chain} as a lender and keep the position open.`;
-  if (c.includes('dex'))
-    return `Add ~$${capital} of liquidity to ${name}'s largest pool on ${chain} and keep the position open.`;
+    return `Supply ~$${capital} of USDC to ${name} on ${chain} as a lender, then borrow ~$20 of the chain's native asset against it and repay it within a week, so the wallet shows both sides of the book.`;
+  if (c.includes('dex') || c.includes('liquidity manager'))
+    return `Add ~$${capital} of liquidity to ${name}'s largest USDC pool on ${chain} in a narrow range and keep the position open, collecting the fees it earns.`;
   if (c.includes('bridge'))
-    return `Bridge ~$${capital} of USDC to ${chain} through ${name} and use the bridged funds in its app.`;
+    return `Bridge ~$${capital} of USDC to ${chain} through ${name}, then swap half of it for the chain's native token in ${name}'s own app so the wallet shows use on both sides.`;
   if (c.includes('restak') || c.includes('liquid staking') || c.includes('staking'))
-    return `Stake ~$${capital} of the chain's staking asset through ${name} on ${chain} and keep the receipt token.`;
+    return `Stake ~$${capital} of the chain's staking asset through ${name} on ${chain}, keep the receipt token, and restake or delegate it once through ${name}'s own restaking page.`;
   if (c.includes('perpetual') || c.includes('derivative') || c.includes('option') || c.includes('basis'))
-    return `Deposit ~$${capital} of USDC as margin on ${name} (${chain}) and open one small hedged position.`;
+    return `Deposit ~$${capital} of USDC as margin on ${name} (${chain}), open one small long and one small short in the same market to stay near-neutral, then close both within a day.`;
   if (c.includes('prediction'))
-    return `Fund your ${name} account with ~$${capital} on ${chain} and take one small market position.`;
+    return `Fund your ${name} account with ~$${capital} on ${chain} and take one small position in a market that settles within a week.`;
   if (c.includes('yield') || c.includes('leveraged farm') || c.includes('curator') || c.includes('allocator') || c.includes('farm'))
-    return `Deposit ~$${capital} of USDC into a ${name} vault on ${chain} and keep the shares.`;
+    return `Deposit ~$${capital} of USDC into a ${name} vault on ${chain} that auto-compounds, and keep the vault shares for the full hold period.`;
   if (c.includes('rwa'))
-    return `Mint ~$${capital} of ${name}'s tokenised yield asset on ${chain} and hold it.`;
+    return `Mint ~$${capital} of ${name}'s tokenised yield asset on ${chain} and hold it; the asset itself accrues the yield, so no extra action is needed.`;
   if (c.includes('insurance'))
-    return `Buy ~$${capital} of cover from ${name} on ${chain} and keep the policy active.`;
-  if (c.includes('payment'))
-    return `Route ~$${capital} of payments through ${name} on ${chain} and keep the receipts.`;
+    return `Buy ~$${capital} of cover from ${name} on ${chain} for a protocol you already use, and keep the policy active for the full hold period.`;
+  if (c.includes('payment') || c.includes('card'))
+    return `Route ~$${capital} of payments through ${name} on ${chain} in at least two separate transfers, and keep both receipts.`;
   if (c.includes('index'))
-    return `Buy ~$${capital} of the ${name} index on ${chain} and hold it.`;
+    return `Buy ~$${capital} of the ${name} index on ${chain} and hold it; rebalance only through the index itself.`;
   if (c.includes('launchpad'))
-    return `Stake or lock ~$${capital} through ${name} on ${chain} to qualify for its launches.`;
+    return `Stake or lock ~$${capital} through ${name} on ${chain} to qualify for its launches, and join one launch while the stake is live.`;
   if (c.includes('stable'))
-    return `Mint or hold ~$${capital} of the stable asset through ${name} on ${chain}.`;
+    return `Mint ~$${capital} of the stable asset through ${name} on ${chain} with USDC collateral, hold it for the full period, then redeem it.`;
   if (c.includes('governance'))
-    return `Lock ~$${capital} in ${name}'s governance on ${chain} and vote on its proposals.`;
+    return `Lock ~$${capital} in ${name}'s governance on ${chain} and vote on at least two proposals while the lock is live.`;
   if (c.includes('chain'))
     return `Use ${name} for a ~$${capital} swap or transfer on ${chain} and keep the transaction receipt.`;
   return `Deposit ~$${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
+/** A second, different qualifying action in the same category, a week after the first. */
+function secondActionFor(p: SnapshotProtocol, chain: string): string {
+  const c = (p.category ?? '').toLowerCase();
+  const name = p.name;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral'))
+    return `Borrow ~$20 against the supplied collateral on ${name} and repay it the same week, so the wallet shows a borrow as well as a supply.`;
+  if (c.includes('dex') || c.includes('liquidity manager'))
+    return `Swap ~$20 through ${name}'s largest pool on ${chain} so the wallet shows trading as well as liquidity.`;
+  if (c.includes('bridge'))
+    return `Bridge a second, smaller amount (~$20) back through ${name} to show two-way use.`;
+  if (c.includes('restak') || c.includes('liquid staking') || c.includes('staking'))
+    return `Delegate or restake the receipt token once more through ${name} on ${chain}.`;
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('option') || c.includes('basis'))
+    return `Open and close one more small hedged position on ${name} (${chain}) to show repeat use.`;
+  if (c.includes('prediction'))
+    return `Take a second small position in a different ${name} market on ${chain}.`;
+  if (c.includes('yield') || c.includes('leveraged farm') || c.includes('curator') || c.includes('allocator') || c.includes('farm'))
+    return `Add ~$20 more to the same ${name} vault on ${chain} to show a second deposit.`;
+  if (c.includes('rwa'))
+    return `Mint another ~$20 of the tokenised asset through ${name} on ${chain}.`;
+  if (c.includes('insurance'))
+    return `Renew or extend the ${name} cover on ${chain} for one more period.`;
+  if (c.includes('payment') || c.includes('card'))
+    return `Route one more payment of ~$20 through ${name} on ${chain}.`;
+  if (c.includes('index'))
+    return `Add ~$20 more to the ${name} index on ${chain}.`;
+  if (c.includes('launchpad'))
+    return `Join a second launch through ${name} on ${chain} while the stake is live.`;
+  if (c.includes('stable'))
+    return `Mint another ~$20 of the stable asset through ${name} on ${chain}.`;
+  if (c.includes('governance'))
+    return `Vote on a second ${name} proposal on ${chain}.`;
+  if (c.includes('chain'))
+    return `Do a second swap or transfer of ~$20 through ${name} on ${chain}.`;
+  return `Do one more qualifying action on ${name} (${chain}), such as a deposit, a swap or a vote.`;
+}
+
 /**
- * A protocol's farm plan: seven steps, each an action with a cost and a time. The
+ * A protocol's farm plan: eight steps, each an action with a cost and a time. The
  * plan is derived from the protocol's own record (category, chains, TVL, age),
  * never from a hand-written list of names. Costs and times are typical figures
- * for the action, marked with ~, never a live quote.
+ * for the action, marked with ~, never a live quote. The last two steps are a
+ * risk note and what to do after the token launches.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
+  const second = secondActionFor(p, chain);
   const fund =
     chain === 'Ethereum'
       ? `Send ~$${capital} of USDC to your fresh wallet on Ethereum from an exchange or another wallet you control.`
-      : `Bridge ~$${capital} of USDC to ${chain} through the chain's official bridge before you touch ${p.name}.`;
+      : `Bridge ~$${capital} of USDC to ${chain} through ${bridgeFor(chain)} before you touch ${p.name}.`;
   return [
     {
       text: `Open a fresh wallet that holds only the funds you plan to farm, and write its seed phrase on paper, never in a screenshot or chat.`,
@@ -486,6 +694,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: 'about 15 minutes to set up',
     },
     {
+      text: second,
+      cost: 'typically ~$2–$5 of gas',
+      time: 'about 10 minutes, a week after the first action',
+    },
+    {
       text: `Do one qualifying action a week on ${p.name}, such as a deposit, a swap, a borrow or a vote, so the wallet shows repeat use rather than a single deposit.`,
       cost: 'typically ~$1–$3 of gas a week',
       time: 'about 10 minutes a week',
@@ -496,14 +709,14 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: `${hold} days`,
     },
     {
-      text: `Before you withdraw, open ${p.name}'s own points or rewards page from its official site or docs and claim only from a link it publishes.`,
-      cost: 'no fee to check, and never pay to claim',
-      time: 'about 10 minutes',
+      text: `Risk: smart contracts can have bugs that lose the ~$${capital} you deposit, and ${p.name} may never issue a token, so farm only with money you can lose. Never pay anyone to claim, and never sign a transaction you do not understand.`,
+      cost: 'nothing to read, and never pay to claim',
+      time: 'about 5 minutes',
     },
     {
-      text: `Write the wallet, the dates and every transaction hash in a farm log so you can repeat the position or unwind it later.`,
-      cost: 'nothing but the log',
-      time: '5 minutes',
+      text: `After the token launches: open ${p.name}'s claim page only from a link on its official site or docs, claim inside the window it sets, decide in advance whether to hold the claim or sell part of it, and write the claim transaction hash in your farm log.`,
+      cost: 'claiming costs gas, typically ~$2–$8; selling costs gas too',
+      time: 'about 15 minutes to claim',
     },
   ];
 }
@@ -544,6 +757,8 @@ export function radarRow(row: BoardRow): RadarRow {
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
     base: row.model.base,
+    comps: row.model.comps,
+    ratio_source: row.model.ratio_source,
     farm_steps: row.farm_steps,
   };
 }
@@ -551,14 +766,20 @@ export function radarRow(row: BoardRow): RadarRow {
 /** One sentence per multiplier, so the dashboard can state the model in plain words. */
 export function modelExplanation(comps: Comparables, model: ModelConstants): string {
   return (
-    `Implied value = TVL x the category's median mcap/TVL ratio, from ${comps.total_comps} tokenised ` +
-    `protocols with a recorded market cap above $0 (categories with fewer than ${model.min_comps_per_category} comps use the ` +
-    `global median ${comps.global_ratio}), x a growth multiplier of 1 + 0.5 x the 7-day TVL change ` +
-    `clamped to ${model.growth_floor}%..${model.growth_cap}%, x a maturity multiplier of ${model.maturity_floor} + ` +
-    `${model.maturity_range} x min(age, ${model.maturity_days}d)/${model.maturity_days}d (unknown age = ` +
-    `${model.unknown_age_days}d), x a chain multiplier of 1 + ${model.chain_log_weight} x ln(chains), capped at ` +
-    `${model.chain_multiplier_cap}. Capped at ${model.implied_cap_multiple}x TVL, floored at $1. The value is this ` +
-    `entry's own claim from the sealed snapshot, not a prediction that a token will launch.`
+    `Implied value = TVL x the category's TVL-band median mcap/TVL ratio, from ${comps.total_comps} tokenised ` +
+    `protocols with a recorded market cap above $0: only comps whose TVL sits within ${model.tvl_band_factor}x of the ` +
+    `subject's price it, at least ${model.band_min_comps} of the category, their median shrunk toward the same ` +
+    `band's global median as (n x cat + ${model.shrinkage_k} x global) / (n + ${model.shrinkage_k}); every comp ` +
+    `ratio is winsorized at the ${Math.round(model.winsorize_percentile * 100)}th percentile (${comps.winsorize_cap}) ` +
+    `first, so one near-dead TVL with a live token cannot set a price. When the band is too thin the ` +
+    `category-wide shrinkage ratio is used, and a category with no comps takes the global median ` +
+    `${comps.global_ratio}. x a growth multiplier of 1 + ${model.growth_weight} x tanh(7-day TVL change / ` +
+    `${model.growth_tanh_scale}), saturating so one wild week cannot dominate (null change = 1.0), x a maturity ` +
+    `multiplier of ${model.maturity_floor} + ${model.maturity_range} x ln(1 + min(age, ${model.maturity_days}d)) / ` +
+    `ln(1 + ${model.maturity_days}d) (unknown age = ${model.unknown_age_days}d), x a chain multiplier of 1 + ` +
+    `${model.chain_log_weight} x ln(chains), capped at ${model.chain_multiplier_cap}. Capped at ` +
+    `${model.implied_cap_multiple}x TVL, floored at $1. The value is this entry's own claim from the sealed ` +
+    `snapshot, not a prediction that a token will launch.`
   );
 }
 
@@ -582,6 +803,7 @@ export function buildRadar(
     base_multiple: comps.global_ratio,
     global_ratio: comps.global_ratio,
     total_comps: comps.total_comps,
+    winsorize_cap: comps.winsorize_cap,
     category_ratios: ratios,
     category_comp_counts: counts,
     explanation: modelExplanation(comps, model),
@@ -673,7 +895,7 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
   }
   for (const r of board) {
     const steps = r.farm_steps;
-    if (steps.length < 5 || steps.length > 7) return `${r.slug} has ${steps.length} farm steps`;
+    if (steps.length < 3 || steps.length > 12) return `${r.slug} has ${steps.length} farm steps`;
     for (const s of steps) if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
   }
