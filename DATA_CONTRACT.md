@@ -23,8 +23,8 @@ fields are added alongside the starter's.
 | `token_status` | `'pre-token'` | |
 | `age_days` | number \| null | days from `listed_at` to `snapshot.as_of`, null when unknown |
 | `implied_value_usd` | integer | strictly decreasing down the board |
-| `model` | object | `{ category_ratio, growth_multiplier, maturity_multiplier, chain_multiplier, base }`; `base = tvl_usd x category_ratio` (rounded) |
-| `farm_steps` | string[7] | each 20–600 chars, action + cost + time |
+| `model` | object | `{ category_ratio, growth_multiplier, maturity_multiplier, chain_multiplier, base, comps, ratio_source }`; `base = tvl_usd x category_ratio` (rounded); `comps` counts the comparables that priced the row; `ratio_source` is `'band'`, `'category'` or `'global'` |
+| `farm_steps` | string[8] | each 20–600 chars, action + cost + time; the last two steps are a risk note and what to do after the token launches |
 
 Coverage: all 40 watchlist slugs, plus the 160 pre-token protocols below
 the $50M floor with the most TVL. A row is on the board only when
@@ -42,7 +42,7 @@ fetch, no network. Top-level fields:
 | `source` | string | snapshot source line, verbatim |
 | `floor_usd` | number | watchlist floor, $50,000,000 here |
 | `model` | object | see below |
-| `model_version` | string | `'radar-2'` |
+| `model_version` | string | `'radar-3'` |
 | `watchlist_size` | number | 40 |
 | `board_size` | number | 200 |
 | `early_size` | number | 160 |
@@ -58,12 +58,16 @@ the numbers without re-running the program:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `base_multiple` | number | the global median mcap/TVL; the fallback multiple for thin categories (kept from the starter's field name) |
-| `growth_weight`, `growth_floor`, `growth_cap` | number | 0.5, -60, 120 |
+| `base_multiple` | number | the global median mcap/TVL; the fallback multiple for a category with no comps (kept from the starter's field name) |
+| `growth_weight`, `growth_tanh_scale` | number | 0.5, 50 |
 | `maturity_floor`, `maturity_range`, `maturity_days`, `unknown_age_days` | number | 0.6, 0.4, 1095, 365 |
 | `chain_log_weight`, `chain_multiplier_cap` | number | 0.05, 1.15 |
 | `implied_cap_multiple` | number | 50 |
-| `min_comps_per_category` | number | 3 |
+| `shrinkage_k` | number | 3 |
+| `tvl_band_factor` | number | 10 |
+| `band_min_comps` | number | 2 |
+| `winsorize_percentile` | number | 0.95 |
+| `winsorize_cap` | number | the 95th percentile of all comp ratios (12.16 here) |
 | `global_ratio` | number | global median mcap/TVL over all comps (same value as `base_multiple`) |
 | `total_comps` | number | comps used: protocols with a recorded market cap above $0 and positive TVL (128 here) |
 | `category_ratios` | Record<string, number> | the median ratio per category (thin categories carry the global ratio) |
@@ -74,8 +78,8 @@ the numbers without re-running the program:
 (`rank`, `slug`, `name`, `category`, `chains`, `tvl_usd`, `change_7d`,
 `mcap_usd`, `listed_at`, `age_days`, `implied_value_usd`,
 `growth_multiplier`, `maturity_multiplier`) **plus**
-`category_ratio`, `chain_multiplier`, `base`, and `farm_steps`
-(the full 7-step plan, so the page never recomputes it).
+`category_ratio`, `chain_multiplier`, `base`, `comps`, `ratio_source`, and `farm_steps`
+(the full 8-step plan, so the page never recomputes it).
 
 `LiveRow`: `{ slug, name, category, chains, tvl_usd, mcap_usd, change_7d }`
 — the market's own values, never a model value.
@@ -88,13 +92,21 @@ id (`gecko_id`), 144 of them also record a market cap, and 16 of those
 record $0 or less (dead or unpriced tokens — Multichain among them — one
 even records -1), so 128 are usable comps.
 
-- `ratio(category)` = median of `mcap_usd / tvl_usd` over the category's
-  comps when the category has >= 3 comps, else the global median over all
-  comps. Median = the middle value, or the mean of the two middle values.
-- `growth = 1 + 0.5 x clamp(change_7d, -60, 120) / 100`; `change_7d` null
-  behaves as 0, so the multiplier is 1.0.
-- `maturity = 0.6 + 0.4 x min(age_days, 1095) / 1095`; unknown age uses
-  365 days. `age_days` is whole days from `listed_at` to `as_of`.
+- `ratio(subject)` = the median of `mcap_usd / tvl_usd` over the subject's
+  category's comps whose TVL sits within 10x of the subject's TVL, at least
+  2 of the category, shrunk toward the same band's global median as
+  (n x band_cat + 3 x band_global) / (n + 3). Every comp ratio is winsorized
+  at the 95th percentile of all comp ratios (12.16 here) before any median,
+  so one near-dead TVL with a live token cannot set a price. When the band
+  holds fewer than 2 comps of the category, the category-wide shrinkage
+  ratio (n x cat_median + 3 x global) / (n + 3) is used; a category with no
+  comps at all takes the global median. Median = the middle value, or the
+  mean of the two middle values.
+- `growth = 1 + 0.5 x tanh(change_7d / 50)`; `change_7d` null behaves as 0,
+  so the multiplier is 1.0.
+- `maturity = 0.6 + 0.4 x ln(1 + min(age_days, 1095)) / ln(1 + 1095)`;
+  unknown age uses 365 days. `age_days` is whole days from `listed_at` to
+  `as_of`.
 - `chain = min(1.15, 1 + 0.05 x ln(max(1, chains.length)))`.
 - `implied = max(1, min(50 x tvl_usd, round(tvl_usd x ratio x growth x maturity x chain)))`.
 
@@ -119,7 +131,7 @@ displayed `implied_value_usd` is that value after the tie-break pass.
 - has any row that is not pre-token (token recorded),
 - is not strictly decreasing in `implied_value_usd`,
 - has all rows sharing one implied value,
-- has a row with fewer than 5 or more than 7 farm steps, a step outside
+- has a row with fewer than 3 or more than 12 farm steps, a step outside
   20–600 characters, or a non-positive implied value.
 
 ## Determinism
