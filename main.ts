@@ -1,4 +1,4 @@
-// Token Radar's entrypoint (Node 22, standard library only): radar-3 model.
+// Token Radar's entrypoint (Node 22, standard library only): radar-4 model.
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input
 // <file|dir>), scores every pre-token protocol with the comparables model in

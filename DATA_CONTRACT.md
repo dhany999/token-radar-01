@@ -42,7 +42,7 @@ fetch, no network. Top-level fields:
 | `source` | string | snapshot source line, verbatim |
 | `floor_usd` | number | watchlist floor, $50,000,000 here |
 | `model` | object | see below |
-| `model_version` | string | `'radar-3'` |
+| `model_version` | string | `'radar-4'` |
 | `watchlist_size` | number | 40 |
 | `board_size` | number | 200 |
 | `early_size` | number | 160 |
@@ -72,6 +72,7 @@ the numbers without re-running the program:
 | `total_comps` | number | comps used: protocols with a recorded market cap above $0 and positive TVL (128 here) |
 | `category_ratios` | Record<string, number> | the median ratio per category (thin categories carry the global ratio) |
 | `category_comp_counts` | Record<string, number> | comps per category |
+| `calibration` | object | `{ n, spearman_model, spearman_tvl }`: Spearman rank correlation over the tokenised comps between the model's implied values and actual market caps (`spearman_model`), and between TVL and actual market caps (`spearman_tvl`, the baseline); `n` is the comp count (128 here). Computed at build time from the snapshot, never hard-coded; rounded to 6 decimals |
 | `explanation` | string | the formula in one plain-English paragraph |
 
 `RadarRow` is the board row in compact form: the starter's fields
@@ -82,7 +83,21 @@ the numbers without re-running the program:
 (the full 8-step plan, so the page never recomputes it).
 
 `LiveRow`: `{ slug, name, category, chains, tvl_usd, mcap_usd, change_7d }`
-— the market's own values, never a model value.
+— the market's own values, never a model value. The dashboard shows a
+`mcap/TVL` column for live rows (`mcap_usd / tvl_usd`), the same ratio the
+comparables are built from.
+
+## Farm plans (radar-4)
+
+Eight steps per row, each 20–600 chars, action + cost + time. Gas costs
+follow the row's first chain: Ethereum ~$5–$15 a transaction, major L2s
+~$0.10–$1, Solana ~$0.01, Tron ~$0.50–$2, other chains ~$0.01–$0.50 —
+typical figures marked `~`, never a live quote. Step 7 is a risk note
+tailored to the row's category: bridge → bridge/smart-contract risk;
+lending/CDP/collateral → oracle + liquidation; perps/derivatives/options/
+basis → funding + liquidation; restaking/staking → slashing; dex/liquidity
+→ impermanent loss + contract; anything else → contract risk +
+may-never-launch. Step 8 covers what to do after the token launches.
 
 ## The model, exactly
 
