@@ -1,9 +1,9 @@
 // Token Radar's model: one sealed snapshot in, one ranked board out. Written for
-// token-radar-01 (model version radar-3), from the snapshot's own figures only.
+// token-radar-01 (model version radar-4), from the snapshot's own figures only.
 //
 // The board ranks pre-token protocols by an implied value built from comparables:
 // every protocol that already has a token and a recorded market cap is a comp.
-// radar-3 prices each protocol against the comps that actually resemble it, and
+// radar-4 prices each protocol against the comps that actually resemble it, and
 // lets momentum move the board instead of letting TVL alone decide it:
 //
 //   ratio      = TVL-band shrinkage multiple (see buildComparables / bandRatio):
@@ -118,7 +118,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -224,6 +224,18 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
+/** Rank calibration, computed at build time from the snapshot's own comps: how
+ * well the model's ranking tracks actual market caps, against the TVL-only
+ * baseline. Never hardcoded — recomputed from the snapshot on every run. */
+export interface Calibration {
+  /** How many tokenised comps the check covers. */
+  n: number;
+  /** Spearman rank correlation between the model's implied values and actual market caps. */
+  spearman_model: number;
+  /** Spearman rank correlation between TVL and actual market caps (the baseline). */
+  spearman_tvl: number;
+}
+
 /** The model as data.js carries it: the constants, the comparables table, and the explanation. */
 export interface RadarModel extends ModelConstants {
   global_ratio: number;
@@ -232,6 +244,8 @@ export interface RadarModel extends ModelConstants {
   category_ratios: Record<string, number>;
   category_comp_counts: Record<string, number>;
   explanation: string;
+  /** Rank calibration over the tokenised comps (see Calibration). */
+  calibration: Calibration;
 }
 
 /** Everything the dashboard needs: the board, the live set, and the model it runs. */
@@ -273,6 +287,72 @@ function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+/** Ranks with ties averaged: the smallest value gets rank 1. */
+function ranks(values: number[]): number[] {
+  const order = values.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v || a.i - b.i);
+  const out = new Array<number>(values.length);
+  let i = 0;
+  while (i < order.length) {
+    let j = i;
+    while (j + 1 < order.length && order[j + 1]!.v === order[i]!.v) j++;
+    const avg = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) out[order[k]!.i] = avg;
+    i = j + 1;
+  }
+  return out;
+}
+
+/**
+ * Spearman's rank correlation between two equal-length series: the Pearson
+ * correlation of their ranks (ties averaged). Returns 0 when either series
+ * is constant or shorter than 2, so a degenerate snapshot cannot produce a
+ * misleading perfect score.
+ */
+export function spearman(xs: number[], ys: number[]): number {
+  if (xs.length !== ys.length || xs.length < 2) return 0;
+  const rx = ranks(xs);
+  const ry = ranks(ys);
+  const n = xs.length;
+  const mx = rx.reduce((a, b) => a + b, 0) / n;
+  const my = ry.reduce((a, b) => a + b, 0) / n;
+  let cov = 0;
+  let vx = 0;
+  let vy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = rx[i]! - mx;
+    const dy = ry[i]! - my;
+    cov += dx * dy;
+    vx += dx * dx;
+    vy += dy * dy;
+  }
+  if (vx === 0 || vy === 0) return 0;
+  return cov / Math.sqrt(vx * vy);
+}
+
+/**
+ * Rank calibration over the snapshot's tokenised comps: score every comp with
+ * the model itself (its implied value from its own TVL, growth, age and
+ * chains, priced against the comparables table) and compare the ranking of
+ * those implied values against the ranking of the comps' actual market caps,
+ * with the ranking of raw TVL as the baseline. The model is not tuned to
+ * this check — the same formulas price the board — so the gap between the
+ * two correlations is the model's evidence that its multipliers add signal
+ * beyond size alone. The level error is deliberately NOT reported: individual
+ * mcap/TVL ratios are extremely dispersed, so a median-based model can rank
+ * well while any single level is off by several times.
+ */
+export function computeCalibration(snapshot: Snapshot, comps: Comparables, model: ModelConstants = MODEL): Calibration {
+  const compProtocols = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const implied = compProtocols.map((p) => impliedValue(p, snapshot.as_of, comps, model).implied);
+  const mcaps = compProtocols.map((p) => p.mcap_usd!);
+  const tvls = compProtocols.map((p) => p.tvl_usd);
+  return {
+    n: compProtocols.length,
+    spearman_model: Math.round(spearman(implied, mcaps) * 1e6) / 1e6,
+    spearman_tvl: Math.round(spearman(tvls, mcaps) * 1e6) / 1e6,
+  };
 }
 
 /**
@@ -513,6 +593,46 @@ export function stepText(step: FarmStep): string {
   return s;
 }
 
+/** Typical gas for one ordinary transaction on a chain, as a "~$a–$b" figure:
+ * Ethereum mainnet is dollars per transaction, the major L2s are cents, Solana
+ * is a fraction of a cent, and other chains sit by tier. Honest typical
+ * figures, marked ~, never a live quote — gas moves with congestion. */
+function gasFor(chain: string): string {
+  if (chain === 'Ethereum') return '$5–$15';
+  if (chain === 'Solana') return '~$0.01';
+  if (chain === 'Tron') return '~$0.50–$2';
+  const l2 = new Set([
+    'Arbitrum', 'Optimism', 'Base', 'zkSync Era', 'Linea', 'Scroll', 'Blast',
+    'Mantle', 'Mode', 'Unichain', 'Soneium', 'Ink', 'Katana', 'Zircuit',
+    'Taiko', 'Starknet', 'World Chain', 'Lisk', 'Manta', 'Morph', 'X Layer',
+    'Polygon zkEVM',
+  ]);
+  if (l2.has(chain)) return '~$0.10–$1';
+  return '~$0.01–$0.50';
+}
+
+/** The risk a farmer actually takes on this protocol, by what the protocol
+ * does: a bridge can strand funds, a lending market can liquidate, a perps
+ * venue can fund and liquidate, restaking can slash, a dex can leave an LP
+ * worth less than holding. Every category still ends with the same warning:
+ * the token may never launch, and nobody legitimate ever charges to claim. */
+function riskFor(p: SnapshotProtocol, capital: number): string {
+  const c = (p.category ?? '').toLowerCase();
+  const name = p.name;
+  const tail = `, and ${name} may never issue a token, so farm only with money you can lose. Never pay anyone to claim, and never sign a transaction you do not understand.`;
+  if (c.includes('bridge'))
+    return `Risk: bridges move funds across chains, so a bridge or smart-contract bug can strand or lose the ~$${capital} you move${tail}`;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral'))
+    return `Risk: oracle prices can move fast and a liquidation can sell your collateral for less than you borrowed${tail}`;
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('option') || c.includes('basis'))
+    return `Risk: funding rates can eat a hedged position and a sharp move can liquidate it${tail}`;
+  if (c.includes('restak') || c.includes('liquid staking') || c.includes('staking'))
+    return `Risk: slashing can cut staked funds and a restaking contract bug can lose the ~$${capital} you deposit${tail}`;
+  if (c.includes('dex') || c.includes('liquidity manager'))
+    return `Risk: impermanent loss can leave the position worth less than holding, and a smart-contract bug can lose the ~$${capital} you deposit${tail}`;
+  return `Risk: smart contracts can have bugs that lose the ~$${capital} you deposit${tail}`;
+}
+
 /** The first chain a protocol names, or a neutral phrase. */
 function chainOf(p: SnapshotProtocol): string {
   return p.chains.length > 0 ? p.chains[0]! : 'its main chain';
@@ -663,9 +783,12 @@ function secondActionFor(p: SnapshotProtocol, chain: string): string {
 /**
  * A protocol's farm plan: eight steps, each an action with a cost and a time. The
  * plan is derived from the protocol's own record (category, chains, TVL, age),
- * never from a hand-written list of names. Costs and times are typical figures
- * for the action, marked with ~, never a live quote. The last two steps are a
- * risk note and what to do after the token launches.
+ * never from a hand-written list of names. Gas costs follow the protocol's
+ * first chain (Ethereum ~$5–$15 a transaction, major L2s ~$0.10–$1, Solana
+ * ~$0.01, other chains by tier), and the risk note (step 7) names the risk
+ * the protocol's own category actually carries. Costs and times are typical
+ * figures for the action, marked with ~, never a live quote. The last two
+ * steps are a risk note and what to do after the token launches.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -673,6 +796,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
   const second = secondActionFor(p, chain);
+  const gas = gasFor(chain);
   const fund =
     chain === 'Ethereum'
       ? `Send ~$${capital} of USDC to your fresh wallet on Ethereum from an exchange or another wallet you control.`
@@ -680,27 +804,27 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   return [
     {
       text: `Open a fresh wallet that holds only the funds you plan to farm, and write its seed phrase on paper, never in a screenshot or chat.`,
-      cost: 'no fee to create; ~$2 of gas for the first transaction',
+      cost: `no fee to create; ${gas} of gas for the first transaction`,
       time: '5 minutes',
     },
     {
       text: fund,
-      cost: 'typically ~$2–$8 of gas',
+      cost: `typically ${gas} of gas`,
       time: 'about 15 minutes',
     },
     {
       text: action,
-      cost: `~$${capital} of capital and typically ~$4–$8 of gas`,
+      cost: `~$${capital} of capital and typically ${gas} of gas`,
       time: 'about 15 minutes to set up',
     },
     {
       text: second,
-      cost: 'typically ~$2–$5 of gas',
+      cost: `typically ${gas} of gas`,
       time: 'about 10 minutes, a week after the first action',
     },
     {
       text: `Do one qualifying action a week on ${p.name}, such as a deposit, a swap, a borrow or a vote, so the wallet shows repeat use rather than a single deposit.`,
-      cost: 'typically ~$1–$3 of gas a week',
+      cost: `typically ${gas} of gas a week`,
       time: 'about 10 minutes a week',
     },
     {
@@ -709,13 +833,13 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: `${hold} days`,
     },
     {
-      text: `Risk: smart contracts can have bugs that lose the ~$${capital} you deposit, and ${p.name} may never issue a token, so farm only with money you can lose. Never pay anyone to claim, and never sign a transaction you do not understand.`,
+      text: riskFor(p, capital),
       cost: 'nothing to read, and never pay to claim',
       time: 'about 5 minutes',
     },
     {
       text: `After the token launches: open ${p.name}'s claim page only from a link on its official site or docs, claim inside the window it sets, decide in advance whether to hold the claim or sell part of it, and write the claim transaction hash in your farm log.`,
-      cost: 'claiming costs gas, typically ~$2–$8; selling costs gas too',
+      cost: `claiming costs gas, typically ${gas}; selling costs gas too`,
       time: 'about 15 minutes to claim',
     },
   ];
@@ -807,6 +931,7 @@ export function buildRadar(
     category_ratios: ratios,
     category_comp_counts: counts,
     explanation: modelExplanation(comps, model),
+    calibration: computeCalibration(snapshot, comps, model),
   };
   const categories = [...new Set(board.map((r) => r.category).filter((c): c is string => c !== null))].sort();
   const chains = [...new Set(board.flatMap((r) => r.chains))].sort();
