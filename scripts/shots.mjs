@@ -20,14 +20,20 @@ const PORT = Number(process.argv.find((a) => a.startsWith('--port='))?.split('='
 
 const MIME = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript' };
 
-async function firstSlug() {
+// The detail shot shows a big climber, not rank 1: hashkey-global moved +153
+// places vs the radar-2 board (rank 39; $8.4M TVL, priced by a TVL-band ratio
+// of 2.64 from 2 comps), so its derivation shows the model working — band
+// pricing lifting a mid-TVL protocol past stagnant giants. Falls back to the
+// top row if the slug ever leaves the board.
+async function detailSlug() {
   const src = await readFile(join(root, 'data.js'), 'utf8');
   const box = { window: {} };
   vm.createContext(box);
   vm.runInContext(src, box);
   const rows = box.window.RADAR?.rows || [];
   if (!rows.length) throw new Error('data.js has no rows');
-  return rows[0].slug;
+  const climber = rows.find((r) => r.slug === 'hashkey-global');
+  return climber ? climber.slug : rows[0].slug;
 }
 
 function serve() {
@@ -64,14 +70,14 @@ async function shot(url, file) {
 async function main() {
   if (!existsSync(CHROME)) throw new Error('Chromium not found at ' + CHROME + ' (set CHROME=...)');
   await mkdir(shotDir, { recursive: true });
-  const slug = await firstSlug();
+  const slug = await detailSlug();
   const srv = await serve();
   try {
     const base = 'http://127.0.0.1:' + PORT + '/dashboard/index.html';
     const jobs = [
       [base, 'board.png'],
       [base + '#p=' + encodeURIComponent(slug), 'detail.png'],
-      [base + '#cat=Dexs&wl=1', 'filtered.png'],
+      [base + '#sort=delta', 'filtered.png'],
     ];
     for (const [url, name] of jobs) {
       const file = join(shotDir, name);
