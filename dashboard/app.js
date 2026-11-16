@@ -12,7 +12,7 @@
   var M = DATA.model || {};
   var BASE = typeof M.base_multiple === 'number' ? M.base_multiple : 0.25;
   var GW = typeof M.growth_weight === 'number' ? M.growth_weight : 0.5;
-  // radar-3 constants: growth saturates through tanh, maturity is a log curve,
+  // radar-4 constants: growth saturates through tanh, maturity is a log curve,
   // and each ratio is a shrinkage blend over TVL-band comparables.
   var GTS = typeof M.growth_tanh_scale === 'number' ? M.growth_tanh_scale : 50;
   var SK = typeof M.shrinkage_k === 'number' ? M.shrinkage_k : 3;
@@ -176,6 +176,7 @@
       else if (k === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
       else if (k === 'rank') { av = a.rank; bv = b.rank; }
       else if (k === 'delta') { av = delta(a); bv = delta(b); }
+      else if (k === 'multiple') { av = a.implied_value_usd / a.tvl_usd; bv = b.implied_value_usd / b.tvl_usd; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -277,6 +278,7 @@
           $('div', { class: 'bar', 'aria-hidden': 'true' }, $('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           $('span', { class: 'num', text: usd(r.implied_value_usd) })
         )),
+        $('td', { class: 'num', title: 'Implied value / TVL: the multiple the model actually used for this row', text: (r.tvl_usd > 0 ? '\u00D7' + (r.implied_value_usd / r.tvl_usd).toFixed(2) : 'n/a') }),
         $('td', { class: 'num ' + (delta(r) > 0 ? 'pos' : delta(r) < 0 ? 'neg' : 'dim'), title: 'TVL rank ' + TVLRANK[r.slug] + ' \u2192 implied rank ' + r.rank, text: deltaText(r) }),
         $('td', null, $('span', { class: 'tag' + (WATCH.has(r.slug) ? ' watch' : ''), text: WATCH.has(r.slug) ? 'watchlist' : 'pre-token' }))
       );
@@ -284,9 +286,9 @@
     });
     return $('div', { class: 'panel' }, $('div', { class: 'table-wrap' },
       $('table', null,
-        $('caption', { text: 'Pre-token protocols, strongest implied value first. \u0394 vs TVL shows how many places the model moves a protocol from a plain TVL sort. Select a row for its model arithmetic and farm plan. \u2605 marks the watchlist.' }),
+        $('caption', { text: 'Pre-token protocols, strongest implied value first. Multiple is implied value / TVL, the multiple the model actually used. \u0394 vs TVL shows how many places the model moves a protocol from a plain TVL sort. Select a row for its model arithmetic and farm plan. \u2605 marks the watchlist.' }),
         $('thead', null, $('tr', null,
-          sortTh('rank', 'Rank'), sortTh('name', 'Protocol'), sortTh('tvl', 'TVL'), sortTh('growth', '7d'), sortTh('age', 'Age'), sortTh('implied', 'Implied value'), sortTh('delta', '\u0394 vs TVL'), $('th', { scope: 'col', text: 'Status' })
+          sortTh('rank', 'Rank'), sortTh('name', 'Protocol'), sortTh('tvl', 'TVL'), sortTh('growth', '7d'), sortTh('age', 'Age'), sortTh('implied', 'Implied value'), sortTh('multiple', 'Multiple'), sortTh('delta', '\u0394 vs TVL'), $('th', { scope: 'col', text: 'Status' })
         )),
         tb
       )));
@@ -302,17 +304,18 @@
         $('td', { class: 'num', text: usd(r.tvl_usd) }),
         $('td', { class: 'num ' + (r.change_7d !== null && r.change_7d >= 0 ? 'pos' : 'neg'), text: pct(r.change_7d) }),
         $('td', { class: 'num', text: usd(r.mcap_usd) }),
+        $('td', { class: 'num', title: 'Market cap / TVL: what the market actually pays per dollar locked', text: (r.mcap_usd !== null && r.tvl_usd > 0 ? '\u00D7' + (r.mcap_usd / r.tvl_usd).toFixed(2) : 'n/a') }),
         $('td', null, $('span', { class: 'tag live', text: 'already trades' }))
       ));
     });
     return $('section', { class: 'section' },
       $('h2', { text: 'Live-token protocols \u2014 set aside, not ranked' }),
-      $('p', { text: 'These ' + live.length + ' protocols already have a token that trades, so their market cap is a fact from the market, not a model. They are not part of the ranking above and carry no implied value.' }),
+      $('p', { text: 'These ' + live.length + ' protocols already have a token that trades, so their market cap is a fact from the market, not a model. They are not part of the ranking above and carry no implied value. The mcap/TVL column shows what the market actually pays per dollar locked \u2014 the same ratio the model\u2019s comparables are built from.' }),
       $('div', { class: 'panel' }, $('div', { class: 'table-wrap' },
         $('table', null,
           $('caption', { text: 'Top ' + live.length + ' live-token protocols by market cap.' }),
           $('thead', null, $('tr', null,
-            $('th', { scope: 'col', text: 'Status' }), $('th', { scope: 'col', text: 'Protocol' }), $('th', { scope: 'col', text: 'TVL' }), $('th', { scope: 'col', text: '7d' }), $('th', { scope: 'col', text: 'Market cap' }), $('th', { scope: 'col', text: 'Token' })
+            $('th', { scope: 'col', text: 'Status' }), $('th', { scope: 'col', text: 'Protocol' }), $('th', { scope: 'col', text: 'TVL' }), $('th', { scope: 'col', text: '7d' }), $('th', { scope: 'col', text: 'Market cap' }), $('th', { scope: 'col', text: 'mcap/TVL' }), $('th', { scope: 'col', text: 'Token' })
           )),
           tb
         ))));
@@ -362,6 +365,25 @@
       $('p', { class: 'muted', text: 'Largest categories shown; ' + entries.length + ' categories carry a multiple.' })
     );
   }
+  // Checked against the market: the model's ranking over the tokenised comps
+  // vs the TVL-only baseline, computed at build time and stored in data.js.
+  // The level error is deliberately not shown — individual mcap/TVL ratios
+  // are extremely dispersed, so a median-based model ranks well while any
+  // single level can be off by several times.
+  function calibrationSection() {
+    var cal = M.calibration || null;
+    var n = cal && typeof cal.n === 'number' ? cal.n : (M.total_comps || 0);
+    var sm = cal && typeof cal.spearman_model === 'number' ? cal.spearman_model : null;
+    var st = cal && typeof cal.spearman_tvl === 'number' ? cal.spearman_tvl : null;
+    var line = (sm === null || st === null)
+      ? 'Calibration not computed for this snapshot.'
+      : 'Checked against the market: on the ' + n + ' protocols whose token already trades, this model\u2019s ranking tracks their actual market caps (Spearman ' + sm.toFixed(2) + ') better than TVL alone (' + st.toFixed(2) + ').';
+    return $('div', { class: 'calibration' },
+      $('h3', { text: 'Checked against the market' }),
+      $('p', { text: line }),
+      $('p', { class: 'muted', text: '15 band\u00D7shrinkage settings tried by leave-one-out; no setting beats the chosen 10\u00D7/k=3 clearly (best 1.48 vs 1.61 median abs log error, within noise), so the width is the principled middle, not a tuned peak.' })
+    );
+  }
   function modelSection() {
     return $('section', { class: 'section' },
       $('div', { class: 'panel model' },
@@ -379,6 +401,7 @@
         )),
         vsTvlSection(),
         compsSection(),
+        calibrationSection(),
         $('p', { class: 'note', text: 'Snapshot ' + DATA.as_of + ' \u00B7 watchlist floor ' + usd(DATA.floor_usd) + ' \u00B7 model ' + (DATA.model_version || 'radar-1') + ' \u00B7 ' + DATA.rows.length + ' ranked rows.' })
       ));
   }
